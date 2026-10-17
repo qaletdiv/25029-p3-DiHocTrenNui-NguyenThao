@@ -111,6 +111,8 @@ export default function ImageListClient({
   const [formStudentId, setFormStudentId] = useState("");
   const [formUrl, setFormUrl] = useState("");
   const [formFileData, setFormFileData] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string>("");
   const [formTimestamp, setFormTimestamp] = useState("");
   const [formEventId, setFormEventId] = useState("");
   const [formMonth, setFormMonth] = useState("");
@@ -309,6 +311,11 @@ export default function ImageListClient({
     setFormStudentId(students[0]?.id || "");
     setFormUrl("");
     setFormFileData("");
+    if (previewUrl && previewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previewUrl);
+    }
+    setSelectedFile(null);
+    setPreviewUrl("");
     setFormTimestamp(new Date().toISOString().substring(0, 10));
     setFormEventId("EVT_" + new Date().toISOString().substring(5, 7) + "_" + new Date().getFullYear());
     setFormMonth(new Date().toISOString().substring(5, 7) + "/" + new Date().getFullYear());
@@ -322,6 +329,11 @@ export default function ImageListClient({
     setFormStudentId(String(img.student_id));
     setFormUrl(img.url);
     setFormFileData("");
+    if (previewUrl && previewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previewUrl);
+    }
+    setSelectedFile(null);
+    setPreviewUrl(img.url ? getProxiedUrl(img.url) : "");
     setFormTimestamp(img.timestamp ? img.timestamp.substring(0, 10) : new Date().toISOString().substring(0, 10));
     setFormEventId(String(img.event_id || ""));
     setFormMonth(String(img.metadata?.month || ""));
@@ -333,16 +345,16 @@ export default function ImageListClient({
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Set filename in formUrl text input
-    setFormUrl(file.name);
+    if (previewUrl && previewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previewUrl);
+    }
 
-    // Read file as base64
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const base64Data = event.target?.result as string;
-      setFormFileData(base64Data);
-    };
-    reader.readAsDataURL(file);
+    setSelectedFile(file);
+    setFormUrl(file.name);
+    setFormFileData("");
+
+    const objectUrl = URL.createObjectURL(file);
+    setPreviewUrl(objectUrl);
   };
 
   const handleModalSubmit = async (e: React.FormEvent) => {
@@ -350,31 +362,52 @@ export default function ImageListClient({
     setFormError("");
     setSubmitting(true);
 
-    if (!formStudentId || !formUrl || !formTimestamp) {
+    if (!formStudentId || (!formUrl && !selectedFile) || !formTimestamp) {
       setFormError("Vui lòng điền đầy đủ các thông tin bắt buộc.");
       setSubmitting(false);
       return;
     }
 
     try {
-      const payload = {
-        student_id: formStudentId as any,
-        url: sanitizeUrlForDatabase(formUrl),
-        timestamp: new Date(formTimestamp).toISOString(),
-        metadata: {
-          month: formMonth
-        },
-        event_id: formEventId || undefined,
-        fileData: formFileData || undefined
-      };
+      if (selectedFile) {
+        // Multipart/form-data upload directly to backend -> Cloudinary
+        const formData = new FormData();
+        formData.append("image", selectedFile);
+        formData.append("student_id", String(formStudentId));
+        formData.append("timestamp", new Date(formTimestamp).toISOString());
+        if (formEventId) formData.append("event_id", formEventId);
+        if (formMonth) formData.append("month", formMonth);
 
-      if (modalMode === "create") {
-        await createImage(payload);
-      } else if (modalMode === "edit" && editingImage) {
-        await updateImage(editingImage.id, payload);
+        if (modalMode === "create") {
+          await createImage(formData);
+        } else if (modalMode === "edit" && editingImage) {
+          await updateImage(editingImage.id, formData);
+        }
+      } else {
+        // Existing URL or update without replacing file
+        const payload = {
+          student_id: formStudentId as any,
+          url: sanitizeUrlForDatabase(formUrl),
+          timestamp: new Date(formTimestamp).toISOString(),
+          metadata: {
+            month: formMonth,
+          },
+          event_id: formEventId || undefined,
+        };
+
+        if (modalMode === "create") {
+          await createImage(payload);
+        } else if (modalMode === "edit" && editingImage) {
+          await updateImage(editingImage.id, payload);
+        }
       }
 
       setIsModalOpen(false);
+      setSelectedFile(null);
+      if (previewUrl && previewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(previewUrl);
+      }
+      setPreviewUrl("");
       setFormFileData("");
       router.refresh();
 
@@ -794,27 +827,32 @@ export default function ImageListClient({
 
               {/* Form Input: Image URL */}
               <div className="space-y-1.5">
-                <label className="text-xs font-bold text-gray-700 uppercase tracking-wider">Đường dẫn hình ảnh (URL) *</label>
+                <label className="text-xs font-bold text-gray-700 uppercase tracking-wider">Đường dẫn hình ảnh (URL) {selectedFile ? "(Tự động từ tệp đã chọn)" : "*"}</label>
                 <input
                   type="text"
-                  required
+                  required={!selectedFile}
                   value={formUrl}
                   onChange={(e) => {
                     setFormUrl(e.target.value);
                     setFormFileData("");
+                    setSelectedFile(null);
+                    if (previewUrl && previewUrl.startsWith("blob:")) {
+                      URL.revokeObjectURL(previewUrl);
+                    }
+                    setPreviewUrl("");
                   }}
-                  placeholder="https://example.com/image.jpg"
+                  placeholder="https://example.com/image.jpg hoặc chọn tệp bên trên"
                   className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:border-primary-700 focus:ring-1 focus:ring-primary-700/30"
                 />
               </div>
 
               {/* Image Preview Box */}
-              {(formUrl || formFileData) && (
+              {(previewUrl || formUrl || formFileData) && (
                 <div className="space-y-1 bg-gray-50 p-2.5 rounded-xl border border-gray-100">
                   <span className="text-[10px] text-gray-400 font-medium block">Xem trước ảnh:</span>
                   <div className="relative w-full aspect-[4/3] rounded-lg overflow-hidden border border-gray-200 bg-white">
                     <SafeImage
-                      src={formFileData || (formUrl ? `${getProxiedUrl(formUrl)}${getProxiedUrl(formUrl).includes('?') ? '&' : '?'}_t=${editingImage?.timestamp ? new Date(editingImage.timestamp).getTime() : Date.now()}` : "")}
+                      src={previewUrl || formFileData || (formUrl ? `${getProxiedUrl(formUrl)}${getProxiedUrl(formUrl).includes('?') ? '&' : '?'}_t=${editingImage?.timestamp ? new Date(editingImage.timestamp).getTime() : Date.now()}` : "")}
                       alt="Xem trước hình ảnh"
                       fill
                       className="object-cover"

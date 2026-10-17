@@ -9,7 +9,7 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
 export interface Image {
     id: number;
-    student_id: number;
+    student_id: string | number;
     url: string;
     timestamp: string;
     metadata: Record<string, unknown>;
@@ -18,21 +18,23 @@ export interface Image {
 }
 
 export interface CreateImagePayload {
-    student_id: number;
-    url: string;
-    timestamp: string;
-    metadata?: Record<string, unknown>;
-    event_id?: string;
-    fileData?: string;
-}
-
-export interface UpdateImagePayload {
-    student_id?: number;
+    student_id: string | number;
     url?: string;
     timestamp?: string;
     metadata?: Record<string, unknown>;
     event_id?: string;
     fileData?: string;
+    month?: string;
+}
+
+export interface UpdateImagePayload {
+    student_id?: string | number;
+    url?: string;
+    timestamp?: string;
+    metadata?: Record<string, unknown>;
+    event_id?: string;
+    fileData?: string;
+    month?: string;
 }
 
 export interface ImageRangeParams {
@@ -50,17 +52,21 @@ export interface PaginatedImages {
 export interface ApiResponse<T> {
     status: string;
     data: T;
+    message?: string;
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
-async function getAuthHeaders(): Promise<HeadersInit> {
+async function getAuthHeaders(isFormData = false): Promise<HeadersInit> {
     const cookieStore = await cookies();
     const token = cookieStore.get("accessToken")?.value;
-    return {
+    const headers: Record<string, string> = {
         "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
     };
+    if (!isFormData) {
+        headers["Content-Type"] = "application/json";
+    }
+    return headers;
 }
 
 // ─── Service Functions ────────────────────────────────────────────────────────
@@ -99,7 +105,7 @@ export async function getImageById(id: number): Promise<ApiResponse<Image>> {
 }
 
 /** GET /images/student/:studentId — Fetch all images for a specific student. */
-export async function getImagesByStudent(studentId: number): Promise<ApiResponse<Image[]>> {
+export async function getImagesByStudent(studentId: string | number): Promise<ApiResponse<Image[]>> {
     const headers = await getAuthHeaders();
     try {
         const res = await fetch(`${BASE_URL}/images/student/${studentId}`, { method: "GET", headers, cache: "no-store" });
@@ -125,12 +131,17 @@ export async function getImagesByRange(params: ImageRangeParams): Promise<ApiRes
     }
 }
 
-/** POST /images — Create a new image record. */
-export async function createImage(payload: CreateImagePayload): Promise<ApiResponse<Image>> {
-    const headers = await getAuthHeaders();
+/** POST /images — Create a new image record via JSON or multipart FormData. */
+export async function createImage(payload: CreateImagePayload | FormData): Promise<ApiResponse<Image>> {
+    const isFormData = typeof FormData !== "undefined" && payload instanceof FormData;
+    const headers = await getAuthHeaders(isFormData);
     try {
-        const res = await fetch(`${BASE_URL}/images`, { method: "POST", headers, body: JSON.stringify(payload) });
-        if (!res.ok) throw new Error(`Failed to create image: ${res.status} ${res.statusText}`);
+        const body = isFormData ? payload : JSON.stringify(payload);
+        const res = await fetch(`${BASE_URL}/images`, { method: "POST", headers, body });
+        if (!res.ok) {
+            const errData = await res.json().catch(() => null);
+            throw new Error(errData?.message || `Failed to create image: ${res.status} ${res.statusText}`);
+        }
         const data = await res.json();
         revalidatePath("/images");
         return data;
@@ -140,12 +151,17 @@ export async function createImage(payload: CreateImagePayload): Promise<ApiRespo
     }
 }
 
-/** PATCH /images/:id — Partially update an image record. */
-export async function updateImage(id: number, payload: UpdateImagePayload): Promise<ApiResponse<Image>> {
-    const headers = await getAuthHeaders();
+/** PATCH /images/:id — Partially update an image record via JSON or multipart FormData. */
+export async function updateImage(id: number, payload: UpdateImagePayload | FormData): Promise<ApiResponse<Image>> {
+    const isFormData = typeof FormData !== "undefined" && payload instanceof FormData;
+    const headers = await getAuthHeaders(isFormData);
     try {
-        const res = await fetch(`${BASE_URL}/images/${id}`, { method: "PATCH", headers, body: JSON.stringify(payload) });
-        if (!res.ok) throw new Error(`Failed to update image ${id}: ${res.status} ${res.statusText}`);
+        const body = isFormData ? payload : JSON.stringify(payload);
+        const res = await fetch(`${BASE_URL}/images/${id}`, { method: "PATCH", headers, body });
+        if (!res.ok) {
+            const errData = await res.json().catch(() => null);
+            throw new Error(errData?.message || `Failed to update image ${id}: ${res.status} ${res.statusText}`);
+        }
         const data = await res.json();
         revalidatePath("/images");
         return data;

@@ -2,15 +2,32 @@ const ImageModel = require('../models/ImageModel');
 const { validateImage } = require('../validations/imageValidation');
 const { sendSuccess, sendError } = require('../utils/responseHandler');
 const { paginate } = require('../utils/pagination');
+const { uploadStream, deleteAsset, isConfigured } = require('../config/cloudinary');
+const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
 
 /**
  * Helper function to format the image response.
- * Dynamically resolves relative image URLs to go through the authenticated image proxy.
+ * Absolute HTTP/HTTPS URLs (including Cloudinary) are returned as-is.
+ * Relative filenames are resolved to the authenticated proxy URL.
  */
 function formatImageResponse(image, req) {
   if (!image || !image.url) return image;
+
+  // Normalize metadata if stored as string in raw queries
+  if (image.metadata && typeof image.metadata === 'string') {
+    try {
+      image.metadata = JSON.parse(image.metadata);
+    } catch (e) {
+      // keep original
+    }
+  }
+
+  // If already an absolute HTTP/HTTPS URL (Cloudinary or remote CDN), return directly
+  if (image.url.startsWith('http://') || image.url.startsWith('https://')) {
+    return image;
+  }
 
   // Defensive checks for req to support mock/test environments
   const headers = req && req.headers ? req.headers : {};
@@ -23,11 +40,6 @@ function formatImageResponse(image, req) {
   }
   const tokenParam = token ? `?token=${token}` : '';
 
-  // Check if it's already an absolute HTTP/HTTPS URL
-  if (image.url.startsWith('http://') || image.url.startsWith('https://')) {
-    return image;
-  }
-
   // Extract base filename from path
   let filename = image.url;
   if (filename.includes('/')) {
@@ -38,7 +50,6 @@ function formatImageResponse(image, req) {
   if (req && typeof req.protocol === 'string' && typeof req.get === 'function') {
     baseUrl = `${req.protocol}://${req.get('host')}`;
   } else {
-    // Fallback if req is not a standard Express Request (e.g. CLI test scripts)
     baseUrl = 'http://localhost:5001';
   }
 
@@ -51,8 +62,7 @@ function formatImageResponse(image, req) {
 }
 
 /**
- * Sanitizes input URLs to store only raw filenames in the database,
- * preventing ephemeral proxy/token strings from being saved.
+ * Sanitizes input URLs to extract clean URLs or filenames.
  */
 function sanitizeInputUrl(url) {
   if (typeof url === 'string' && url.includes('/images/proxy/')) {
@@ -63,7 +73,31 @@ function sanitizeInputUrl(url) {
 }
 
 /**
- * Decodes base64 file data and writes it synchronously to the public upload directory.
+ * Checks if a Cloudinary public_id is referenced by another image record in TiDB.
+ * @param {string} publicId - Cloudinary public_id
+ * @param {number} [excludeId] - Optional image record ID to exclude
+ * @returns {Promise<boolean>}
+ */
+async function isPublicIdReferencedElsewhere(publicId, excludeId = null) {
+  if (!publicId) return false;
+  try {
+    let sql = "SELECT COUNT(*) AS count FROM images WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.public_id')) = ?";
+    const params = [publicId];
+    if (excludeId !== null && excludeId !== undefined) {
+      sql += " AND id != ?";
+      params.push(excludeId);
+    }
+    const [rows] = await db.query(sql, params);
+    return Boolean(rows && rows[0] && rows[0].count > 0);
+  } catch (err) {
+    console.error('[Reference Check Error] Failed to check public_id references:', err.message);
+    // If check fails unexpectedly, conservatively assume referenced to avoid data loss
+    return true;
+  }
+}
+
+/**
+ * Legacy helper for saving base64 to local disk if Cloudinary is unconfigured.
  */
 function saveUploadedFile(filename, fileData) {
   if (!filename || !fileData) return;
@@ -96,7 +130,11 @@ class ImageController {
         images = images.filter(img => {
           const studentIdMatch = String(img.student_id).toLowerCase().includes(searchQuery);
           const eventIdMatch = img.event_id && String(img.event_id).toLowerCase().includes(searchQuery);
-          const monthMatch = img.metadata && img.metadata.month && String(img.metadata.month).toLowerCase().includes(searchQuery);
+          let meta = img.metadata;
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch (e) { meta = {}; }
+          }
+          const monthMatch = meta && meta.month && String(meta.month).toLowerCase().includes(searchQuery);
           return studentIdMatch || eventIdMatch || monthMatch;
         });
       }
@@ -112,13 +150,11 @@ class ImageController {
   async getImageById(req, res) {
     try {
       const imageId = parseInt(req.params.id, 10);
-      // First check if the image exists in TiDB
       const rawImage = await ImageModel.findById(imageId);
       if (!rawImage) {
         return sendError(res, 'Image not found', [], 404);
       }
 
-      // Check access permission
       const image = await ImageModel.findById(imageId, req.user);
       if (!image) {
         return sendError(res, 'Access Denied: You are not authorized to view this image', [], 403);
@@ -133,7 +169,6 @@ class ImageController {
   async getImagesByStudent(req, res) {
     try {
       const studentId = req.params.studentId;
-      // If user is not authorized to view this student's data, return a 403 Forbidden error
       if (req.user && !(await ImageModel.isStudentAuthorized(studentId, req.user))) {
         return sendError(res, "Access Denied: You are not authorized to view this student's images", [], 403);
       }
@@ -161,32 +196,115 @@ class ImageController {
   }
 
   async createImage(req, res) {
+    let uploadedAsset = null;
     try {
-      let fileData = null;
-      if (req.body && req.body.fileData) {
-        fileData = req.body.fileData;
+      // Parse metadata object
+      let metadataObj = {};
+      if (req.body && req.body.metadata) {
+        if (typeof req.body.metadata === 'string') {
+          try {
+            metadataObj = JSON.parse(req.body.metadata);
+          } catch (e) {
+            metadataObj = {};
+          }
+        } else if (typeof req.body.metadata === 'object') {
+          metadataObj = { ...req.body.metadata };
+        }
+      }
+      if (req.body && req.body.month && !metadataObj.month) {
+        metadataObj.month = req.body.month;
+      }
+
+      // 1. Handle in-memory file upload via Cloudinary
+      if (req.file && req.file.buffer) {
+        const studentId = req.body.student_id || 'unassigned';
+        const folder = `dhtn/students/${studentId}`;
+
+        uploadedAsset = await uploadStream(req.file.buffer, { folder });
+        req.body.url = uploadedAsset.secure_url;
+        metadataObj = {
+          ...metadataObj,
+          public_id: uploadedAsset.public_id,
+          width: uploadedAsset.width,
+          height: uploadedAsset.height,
+          format: uploadedAsset.format,
+          bytes: uploadedAsset.bytes,
+          resource_type: uploadedAsset.resource_type,
+          secure_url: uploadedAsset.secure_url,
+        };
+      } else if (req.body && req.body.fileData) {
+        // Fallback for legacy base64 fileData
+        const fileData = req.body.fileData;
         delete req.body.fileData;
+        const commaIdx = fileData.indexOf(';base64,');
+        if (commaIdx !== -1) {
+          const buffer = Buffer.from(fileData.substring(commaIdx + 8), 'base64');
+          if (isConfigured()) {
+            const studentId = req.body.student_id || 'unassigned';
+            uploadedAsset = await uploadStream(buffer, { folder: `dhtn/students/${studentId}` });
+            req.body.url = uploadedAsset.secure_url;
+            metadataObj = {
+              ...metadataObj,
+              public_id: uploadedAsset.public_id,
+              width: uploadedAsset.width,
+              height: uploadedAsset.height,
+              format: uploadedAsset.format,
+              bytes: uploadedAsset.bytes,
+              resource_type: uploadedAsset.resource_type,
+              secure_url: uploadedAsset.secure_url,
+            };
+          } else {
+            saveUploadedFile(req.body.url, fileData);
+          }
+        }
       }
 
       if (req.body && req.body.url) {
         req.body.url = sanitizeInputUrl(req.body.url);
       }
+
+      // If timestamp is missing, default to now for validation
+      if (!req.body.timestamp) {
+        req.body.timestamp = new Date().toISOString();
+      }
+
       const validation = validateImage(req.body);
       if (!validation.isValid) {
+        // Rollback uploaded Cloudinary asset if validation fails
+        if (uploadedAsset && uploadedAsset.public_id) {
+          try {
+            await deleteAsset(uploadedAsset.public_id);
+          } catch (cleanupErr) {
+            console.error('[Rollback Cleanup Error]', cleanupErr.message);
+          }
+        }
         return sendError(res, 'Validation failed', validation.errors, 400);
       }
 
-      if (fileData) {
-        saveUploadedFile(req.body.url, fileData);
+      // 2. Persist record to TiDB with rollback on DB failure
+      let newImage;
+      try {
+        const newId = await ImageModel.generateNextId();
+        newImage = await ImageModel.create({
+          id: newId,
+          student_id: req.body.student_id,
+          event_id: req.body.event_id || null,
+          url: req.body.url,
+          timestamp: req.body.timestamp || new Date(),
+          metadata: metadataObj,
+        });
+      } catch (dbError) {
+        // Automatic rollback of Cloudinary asset if database write fails
+        if (uploadedAsset && uploadedAsset.public_id) {
+          try {
+            await deleteAsset(uploadedAsset.public_id);
+            console.log(`[Cloudinary Rollback] Successfully deleted orphaned asset: ${uploadedAsset.public_id}`);
+          } catch (cleanupErr) {
+            console.error(`[Cloudinary Rollback Error] Failed to delete ${uploadedAsset.public_id}:`, cleanupErr.message);
+          }
+        }
+        throw dbError; // surface original error without masking
       }
-
-      const newId = await ImageModel.generateNextId();
-      const newImage = await ImageModel.create({
-        id: newId,
-        ...req.body,
-        timestamp: req.body.timestamp || new Date(),
-        metadata: req.body.metadata || {},
-      });
 
       return sendSuccess(res, formatImageResponse(newImage, req), 'Image created successfully', 201);
     } catch (error) {
@@ -195,27 +313,126 @@ class ImageController {
   }
 
   async updateImage(req, res) {
+    let newlyUploadedAsset = null;
     try {
-      let fileData = null;
-      if (req.body && req.body.fileData) {
-        fileData = req.body.fileData;
+      const imageId = parseInt(req.params.id, 10);
+      const existingImage = await ImageModel.findById(imageId);
+      if (!existingImage) {
+        return sendError(res, 'Image not found', [], 404);
+      }
+
+      let existingMeta = {};
+      if (existingImage.metadata) {
+        if (typeof existingImage.metadata === 'string') {
+          try { existingMeta = JSON.parse(existingImage.metadata); } catch (e) { existingMeta = {}; }
+        } else if (typeof existingImage.metadata === 'object') {
+          existingMeta = { ...existingImage.metadata };
+        }
+      }
+
+      let incomingMeta = {};
+      if (req.body && req.body.metadata) {
+        if (typeof req.body.metadata === 'string') {
+          try { incomingMeta = JSON.parse(req.body.metadata); } catch (e) { incomingMeta = {}; }
+        } else if (typeof req.body.metadata === 'object') {
+          incomingMeta = { ...req.body.metadata };
+        }
+      }
+      if (req.body && req.body.month) {
+        incomingMeta.month = req.body.month;
+      }
+
+      // Handle replacement file upload
+      if (req.file && req.file.buffer) {
+        const studentId = req.body.student_id || existingImage.student_id || 'unassigned';
+        const folder = `dhtn/students/${studentId}`;
+
+        newlyUploadedAsset = await uploadStream(req.file.buffer, { folder });
+        req.body.url = newlyUploadedAsset.secure_url;
+        incomingMeta = {
+          ...incomingMeta,
+          public_id: newlyUploadedAsset.public_id,
+          width: newlyUploadedAsset.width,
+          height: newlyUploadedAsset.height,
+          format: newlyUploadedAsset.format,
+          bytes: newlyUploadedAsset.bytes,
+          resource_type: newlyUploadedAsset.resource_type,
+          secure_url: newlyUploadedAsset.secure_url,
+        };
+      } else if (req.body && req.body.fileData) {
+        const fileData = req.body.fileData;
         delete req.body.fileData;
+        const commaIdx = fileData.indexOf(';base64,');
+        if (commaIdx !== -1) {
+          const buffer = Buffer.from(fileData.substring(commaIdx + 8), 'base64');
+          if (isConfigured()) {
+            const studentId = req.body.student_id || existingImage.student_id || 'unassigned';
+            newlyUploadedAsset = await uploadStream(buffer, { folder: `dhtn/students/${studentId}` });
+            req.body.url = newlyUploadedAsset.secure_url;
+            incomingMeta = {
+              ...incomingMeta,
+              public_id: newlyUploadedAsset.public_id,
+              width: newlyUploadedAsset.width,
+              height: newlyUploadedAsset.height,
+              format: newlyUploadedAsset.format,
+              bytes: newlyUploadedAsset.bytes,
+              resource_type: newlyUploadedAsset.resource_type,
+              secure_url: newlyUploadedAsset.secure_url,
+            };
+          } else {
+            saveUploadedFile(req.body.url, fileData);
+          }
+        }
       }
 
       if (req.body && req.body.url) {
         req.body.url = sanitizeInputUrl(req.body.url);
       }
+
       const validation = validateImage(req.body, true);
       if (!validation.isValid) {
+        if (newlyUploadedAsset && newlyUploadedAsset.public_id) {
+          try { await deleteAsset(newlyUploadedAsset.public_id); } catch (e) {}
+        }
         return sendError(res, 'Validation failed', validation.errors, 400);
       }
 
-      if (fileData) {
-        saveUploadedFile(req.body.url, fileData);
+      const updateData = {
+        ...req.body,
+        metadata: {
+          ...existingMeta,
+          ...incomingMeta,
+        },
+      };
+
+      let updatedImage;
+      try {
+        updatedImage = await ImageModel.update(imageId, updateData);
+      } catch (dbError) {
+        // Rollback newly uploaded asset if DB update fails
+        if (newlyUploadedAsset && newlyUploadedAsset.public_id) {
+          try {
+            await deleteAsset(newlyUploadedAsset.public_id);
+            console.log(`[Cloudinary Rollback] Cleaned up asset ${newlyUploadedAsset.public_id} after DB update failure`);
+          } catch (cleanupErr) {
+            console.error(`[Cloudinary Rollback Error]`, cleanupErr.message);
+          }
+        }
+        throw dbError;
       }
 
-      const updatedImage = await ImageModel.update(parseInt(req.params.id, 10), req.body);
-      if (!updatedImage) return sendError(res, 'Image not found', [], 404);
+      // Safe replacement: if new asset uploaded and DB update succeeded, delete old asset only if unreferenced elsewhere
+      if (newlyUploadedAsset && existingMeta.public_id && existingMeta.public_id !== newlyUploadedAsset.public_id) {
+        const isReferenced = await isPublicIdReferencedElsewhere(existingMeta.public_id, imageId);
+        if (!isReferenced) {
+          try {
+            await deleteAsset(existingMeta.public_id);
+            console.log(`[Cloudinary Replacement] Old asset ${existingMeta.public_id} destroyed safely`);
+          } catch (delErr) {
+            console.error(`[Cloudinary Replacement Error] Failed to destroy old asset ${existingMeta.public_id}:`, delErr.message);
+          }
+        }
+      }
 
       return sendSuccess(res, formatImageResponse(updatedImage, req), 'Image updated successfully');
     } catch (error) {
@@ -225,8 +442,36 @@ class ImageController {
 
   async deleteImage(req, res) {
     try {
-      const success = await ImageModel.delete(parseInt(req.params.id, 10));
+      const imageId = parseInt(req.params.id, 10);
+      const existingImage = await ImageModel.findById(imageId);
+      if (!existingImage) {
+        return sendError(res, 'Image not found', [], 404);
+      }
+
+      let existingMeta = {};
+      if (existingImage.metadata) {
+        if (typeof existingImage.metadata === 'string') {
+          try { existingMeta = JSON.parse(existingImage.metadata); } catch (e) { existingMeta = {}; }
+        } else if (typeof existingImage.metadata === 'object') {
+          existingMeta = { ...existingImage.metadata };
+        }
+      }
+
+      const success = await ImageModel.delete(imageId);
       if (!success) return sendError(res, 'Image not found', [], 404);
+
+      // Safe deletion: delete Cloudinary asset if not referenced by another record
+      if (existingMeta.public_id) {
+        const isReferenced = await isPublicIdReferencedElsewhere(existingMeta.public_id, imageId);
+        if (!isReferenced) {
+          try {
+            await deleteAsset(existingMeta.public_id);
+            console.log(`[Cloudinary Deletion] Asset ${existingMeta.public_id} deleted safely`);
+          } catch (delErr) {
+            console.error(`[Cloudinary Deletion Error] Failed to delete asset ${existingMeta.public_id}:`, delErr.message);
+          }
+        }
+      }
 
       return sendSuccess(res, null, 'Image deleted successfully');
     } catch (error) {
@@ -240,10 +485,8 @@ class ImageController {
       const filePath = path.join(__dirname, '../public/upload/event', filename);
       const fallbackPath = path.join(__dirname, '../public/placeholder.jpg');
 
-      // Check access permission at the repository/model layer
       const image = await ImageModel.findOne({ url: filename }, req.user);
       if (!image) {
-        // Find if the image exists at all to determine if it is unauthorized (403) or just not found (404)
         const rawImage = await ImageModel.findOne({ url: filename });
         if (rawImage) {
           return res.status(403).send('Forbidden: Access Denied');
@@ -251,7 +494,7 @@ class ImageController {
       }
 
       const options = {
-        maxAge: '1d', // Cache for 1 day
+        maxAge: '1d',
         immutable: true,
         lastModified: true,
         etag: true,
@@ -260,7 +503,6 @@ class ImageController {
       if (fs.existsSync(filePath)) {
         return res.sendFile(filePath, options);
       } else {
-        // Fallback to placeholder if file does not exist
         if (fs.existsSync(fallbackPath)) {
           return res.sendFile(fallbackPath, { maxAge: '1h', lastModified: true, etag: true });
         } else {
